@@ -2,3 +2,4 @@ displayName = Transferable Loadouts
 author = MingCat
 version = 1.01
 homepage = https://discord.gg/TgTqhkbNCv
+sortAfter = ExtraLoadouts

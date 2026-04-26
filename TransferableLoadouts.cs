@@ -1,29 +1,42 @@
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using Mono.Cecil.Cil;
+using MonoMod.Cil;
+using MonoMod.RuntimeDetour;
+using ReLogic.Content;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Text;
-using System.Threading.Tasks;
-using Terraria.Audio;
-using Terraria.GameContent.Drawing;
-using Terraria.ID;
 using Terraria;
-using Terraria.ModLoader;
-using Terraria.UI;
-using Terraria.ModLoader.Default;
-using Microsoft.Xna.Framework.Graphics;
-using Microsoft.Xna.Framework;
-using Newtonsoft.Json.Linq;
-using ReLogic.Content;
 using Terraria.Localization;
-using System.Collections.ObjectModel;
+using Terraria.ModLoader;
+using Terraria.ModLoader.Default;
 using Terraria.ModLoader.IO;
+using Terraria.UI;
 
 namespace TransferableLoadouts
 {
     public class TransferableLoadouts : Mod
     {
-        public static List<string> incompatibleModNames = [];
+        public static readonly int[] EquipSlots = [
+            ItemSlot.Context.EquipArmor,
+            ItemSlot.Context.EquipArmorVanity,
+            ItemSlot.Context.EquipAccessory,
+            ItemSlot.Context.EquipAccessoryVanity,
+            ItemSlot.Context.EquipDye,
+
+            ItemSlotContext_ModAccessorySlot_EquipAccessory,
+            ItemSlotContext_ModAccessorySlot_EquipAccessoryVanity,
+            ItemSlotContext_ModAccessorySlot_EquipDye
+        ];
+
+        public const int ItemSlotContext_ModAccessorySlot_EquipAccessory = -10;
+        public const int ItemSlotContext_ModAccessorySlot_EquipAccessoryVanity = -11;
+        public const int ItemSlotContext_ModAccessorySlot_EquipDye = -12;
+
+        private ILHook Hook_ModAccessorySlotPlayer_OnEquipmentLoadoutSwitched;
+
         public override void Load()
         {
             // The type that contains the field we want to change.
@@ -65,29 +78,200 @@ namespace TransferableLoadouts
             {
                 Logger.Error("Could not find field 'canFavoriteAt' in Terraria.UI.ItemSlot. This may be due to a game update.");
             }
-            incompatibleModNames = GetIncompatibleModNames();
-            bool noIncompatibilities = incompatibleModNames.Count == 0;
 
-            if (noIncompatibilities)
-                On_Player.TrySwitchingLoadout += TrySwitchingLoadoutWithFavorites;
+            // We edit the same method as Extra Equipment Loadouts, so we try to register our callback with them to avoid any possible incompatabilities
+            // This also causes our callback to be called when switching to and from loadouts added by them, which would not happen if we only edited the Vanilla method
+            if (LoadoutHelper.Advanced.RegisterPostSwapCallback((player, _, _) => { CopyLoadoutFavoritesForVanillaSlots(player); CopyLoadoutFavoritesForModLoaderSlots(player); }))
+            {
+                Logger.Info("Registered CopyLoadoutFavoritesForVanillaSlots() and CopyLoadoutFavoritesForModLoaderSlots() with Extra Equipment Loadouts.");
+            }
+            else
+            {
+                IL_Player.TrySwitchingLoadout += TrySwitchingLoadout_CallCopyFavorites;
+                Logger.Info("Inserted CopyLoadoutFavoritesForVanillaSlots() call into Player::TrySwitchingLoadout().");
+
+                // We have to use the ILHook class because we are patching an internal tModLoader class which they do not hookgen IL_* classes for
+                Hook_ModAccessorySlotPlayer_OnEquipmentLoadoutSwitched = new ILHook(typeof(ModAccessorySlotPlayer).GetMethod(nameof(ModAccessorySlotPlayer.OnEquipmentLoadoutSwitched)), OnEquipmentLoadoutSwitched_CallCopyFavorites);
+                Logger.Info("Inserted CopyLoadoutFavoritesForModLoaderSlots() call into ModAccessorySlotPlayer::OnEquipmentLoadoutSwitched().");
+            }
+
 
             On_ItemSlot.Draw_SpriteBatch_ItemArray_int_int_Vector2_Color += DrawWithFavoritedOverlay;
             On_ItemSlot.LeftClick_ItemArray_int_int += DontUnfavorite1;//WhenLeftClickEquipping;
             On_ItemSlot.ArmorSwap += DontUnfavorite2; //whenrightClickingInventoryItemToArmor"
             //On_ItemSlot.EquipSwap += DontUnfavorite3; // whenrightclickinginventoryitemto"BonusEquips"
         }
-        public static List<string> GetIncompatibleModNames()
+
+        private void TrySwitchingLoadout_CallCopyFavorites(ILContext il)
         {
-            List<string> modNames = [];
-            if (ModLoader.TryGetMod("ExtraLoadouts", out Mod extraLoadouts))
-                modNames.Add($"{extraLoadouts.DisplayName} ({extraLoadouts.Name})");
-            return modNames;
+            ILCursor c = new(il);
+
+            if (!c.TryGotoNext(MoveType.After, instr => instr.MatchCall(typeof(PlayerLoader), nameof(PlayerLoader.OnEquipmentLoadoutSwitched))))
+            {
+                throw new Exception("Failed while patching Player::TrySwitchingLoadout(): could not match (call PlayerLoader::OnEquipmentLoadoutSwitched)");
+            }
+
+            // This should move us to right after loadouts have been swapped and the players loadout index has been updated
+
+            c.Emit(OpCodes.Ldarg_0);
+            c.EmitDelegate(CopyLoadoutFavoritesForVanillaSlots);
         }
+
+        private void OnEquipmentLoadoutSwitched_CallCopyFavorites(ILContext il)
+        {
+            ILCursor c = new(il);
+
+            if (!c.TryGotoNext(MoveType.After, instr => instr.MatchCall(typeof(ModAccessorySlotPlayer), "DetectConflictsWithSharedSlots")))
+            {
+                throw new Exception("Failed while patching ModAccessorySlotPlayer::OnEquipmentLoadoutSwitched(): could not match (call ModAccessorySlotPlayer::DetectConflictsWithSharedSlots)");
+            }
+
+            // This moves us to immediately after tML has swapped items for its loadouts
+
+            c.Emit(OpCodes.Ldarg_0);
+            c.EmitCall(typeof(ModPlayer).GetProperty(nameof(ModPlayer.Player)).GetAccessors()[0]);
+            c.EmitDelegate(CopyLoadoutFavoritesForModLoaderSlots);
+        }
+
+        /// <summary>
+        /// <para>Copies the favorited item from the same slot in the earliest loadout for every empty slot in the current loadout.</para>
+        /// <para>Must be called every time loadouts switch.</para>
+        /// </summary>
+        public void CopyLoadoutFavoritesForVanillaSlots(Player player)
+        {
+            int numLoadouts = LoadoutHelper.TotalLoadouts();
+
+            /* ---- VANILLA LOADOUTS ---- */
+            // Fill empty slots with first valid favorited items
+            for (int i = 0; i < player.armor.Length; i++)
+            {
+                if (!player.armor[i].IsAir) continue;
+
+                for (int j = 0; j < numLoadouts; j++)
+                {
+                    EquipmentLoadout loadout = LoadoutHelper.GetLoadout(player, j);
+                    Item potentialItem = loadout.Armor[i];
+                    if (potentialItem.IsAir || !potentialItem.favorited) continue;
+
+                    bool vanity = i >= 10;
+                    bool canEquip = true;
+
+                    if (potentialItem.accessory && !IsAccessoryCompatible(player, potentialItem, vanity))
+                        canEquip = false;
+
+                    if (canEquip)
+                    {
+                        // Swapping the item rather than cloning it create ghost copies of the item for some reason, so don't do that
+                        player.armor[i] = potentialItem.Clone();
+                        potentialItem.TurnToAir(true);
+                        break;
+                    }
+                }
+            }
+
+            // Same for dye
+            for (int i = 0; i < player.dye.Length; i++)
+            {
+                if (!player.armor[i].IsAir) continue;
+
+                for (int j = 0; j < numLoadouts; j++)
+                {
+                    EquipmentLoadout loadout = LoadoutHelper.GetLoadout(player, j);
+                    Item potentialDye = loadout.Dye[i];
+                    if (potentialDye.IsAir || !potentialDye.favorited) continue;
+
+                    player.dye[i] = potentialDye.Clone();
+                    potentialDye.TurnToAir(true);
+                    break;
+                }
+            }
+        }
+
+        /// <summary>
+        /// <para>Copies the favorited item from the same ModAccessorySlot in the earliest loadout for every empty ModAccessorySlot in the current loadout.</para>
+        /// <para>Must be called every time loadouts switch.</para>
+        /// </summary>
+        public void CopyLoadoutFavoritesForModLoaderSlots(Player player)
+        {
+            int numLoadouts = LoadoutHelper.TotalLoadouts();
+
+            /* ---- MODDED LOADOUTS ---- */
+            var modPlayer = player.GetModPlayer<ModAccessorySlotPlayer>();
+            // tML creates unloaded slot entries at the end of the array so that players don't loose their items when they disable a mod that adds accessory slots
+            // For consistency, we only want to deal with loaded slots.
+            var loadedSlotCount = modPlayer.LoadedSlotCount;
+
+            // TODO cleanup/consolodate
+            for (int i = 0; i < modPlayer.LoadedSlotCount; i++)
+            {
+                var accessorySlot = LoaderManager.Get<AccessorySlotLoader>().Get(i);
+
+                if (accessorySlot.FunctionalItem.IsAir)
+                {
+                    for (int j = 0; j < numLoadouts; j++)
+                    {
+                        var loadout = LoadoutHelper.Advanced.GetModLoaderLoadout(player, j);
+                        Item potentialItem = loadout.Items[i];
+                        if (potentialItem.IsAir || !potentialItem.favorited) continue;
+
+                        bool canEquip = true;
+
+                        if (potentialItem.accessory && !IsAccessoryCompatible(player, potentialItem, false))
+                            canEquip = false;
+
+                        if (canEquip)
+                        {
+                            accessorySlot.FunctionalItem = potentialItem.Clone();
+                            potentialItem.TurnToAir(true);
+                            break;
+                        }
+                    }
+                }
+
+                if (accessorySlot.VanityItem.IsAir)
+                {
+                    for (int j = 0; j < numLoadouts; j++)
+                    {
+                        var loadout = LoadoutHelper.Advanced.GetModLoaderLoadout(player, j);
+                        int vanityOffset = loadout.Items.Length / 2;
+                        Item potentialItem = loadout.Items[i + vanityOffset];
+                        if (potentialItem.IsAir || !potentialItem.favorited) continue;
+
+                        bool canEquip = true;
+
+                        if (potentialItem.accessory && !IsAccessoryCompatible(player, potentialItem, true))
+                            canEquip = false;
+
+                        if (canEquip)
+                        {
+                            accessorySlot.VanityItem = potentialItem.Clone();
+                            potentialItem.TurnToAir(true);
+                            break;
+                        }
+                    }
+                }
+
+                if (accessorySlot.DyeItem.IsAir)
+                {
+                    for (int j = 0; j < numLoadouts; j++)
+                    {
+                        var loadout = LoadoutHelper.Advanced.GetModLoaderLoadout(player, j);
+                        Item potentialItem = loadout.Dye[i];
+                        if (potentialItem.IsAir || !potentialItem.favorited) continue;
+
+                        accessorySlot.DyeItem = potentialItem.Clone();
+                        potentialItem.TurnToAir(true);
+                        break;
+                    }
+                }
+            }
+        }
+
         private void DontUnfavorite1(On_ItemSlot.orig_LeftClick_ItemArray_int_int orig, Item[] inv, int context, int slot)
         {
             Item oldMouseItem = Main.mouseItem.Clone();
             bool triedToEquipItem = !Main.mouseItem.IsAir && Main.mouseLeftRelease && Main.mouseLeft && Main.cursorOverride == -1
-                && context is ItemSlot.Context.EquipArmor or ItemSlot.Context.EquipAccessory or ItemSlot.Context.EquipArmorVanity or ItemSlot.Context.EquipAccessoryVanity or ItemSlot.Context.EquipDye;
+                && EquipSlots.Contains(context);
 
             bool mouseItemWasFavorited = Main.mouseItem.favorited;
             bool slotItemWasFavorited = inv[slot].favorited;
@@ -111,143 +295,33 @@ namespace TransferableLoadouts
         {
             bool wasFavorited = item.favorited;
             Item result = orig(item, out success);
-            if (success && wasFavorited && Main.LocalPlayer.armor.FirstOrDefault(item.IsTheSameAs) is Item equippedItem)
-                Main.LocalPlayer.armor.First(equippedItem => item.IsTheSameAs(equippedItem)).favorited = true;
+            if (success && wasFavorited)
+            {
+                if (Main.LocalPlayer.armor.FirstOrDefault(item.IsTheSameAs) is Item equippedItem)
+                    Main.LocalPlayer.armor.First(item.IsTheSameAs).favorited = true;
+
+                // todo same but for modded
+            }
             return result;
         }
 
         private void DrawWithFavoritedOverlay(On_ItemSlot.orig_Draw_SpriteBatch_ItemArray_int_int_Vector2_Color orig, SpriteBatch spriteBatch, Item[] inv, int context, int slot, Vector2 position, Color lightColor)
         {
             orig(spriteBatch, inv, context, slot, position, lightColor);
-            if (context is ItemSlot.Context.EquipArmor or ItemSlot.Context.EquipAccessory or ItemSlot.Context.EquipArmorVanity or ItemSlot.Context.EquipAccessoryVanity or ItemSlot.Context.EquipDye
-                && inv[slot].favorited)
+            if (EquipSlots.Contains(context) && inv[slot].favorited)
             {
                 inv[slot].favorited = false;
-                    orig(spriteBatch, inv, context, slot, position, lightColor);
+                orig(spriteBatch, inv, context, slot, position, lightColor);
                 inv[slot].favorited = true; //Could This Be The Hackiest Code Of All Time?
 
-                Color borderColor = ItemSlot.GetColorByLoadout(slot, context).Brighten(1.6f);
+                // We need to take the absolute value of context because tModLoader accessory slots are negative
+                Color borderColor = ItemSlot.GetColorByLoadout(slot, int.Abs(context)).Brighten(1.6f);
                 Texture2D tex = ModContent.Request<Texture2D>("TransferableLoadouts/Inventory_Back13_FavoriteOverlay", AssetRequestMode.ImmediateLoad).Value;
                 spriteBatch.Draw(tex, position, null, borderColor, 0f, default, Main.inventoryScale, SpriteEffects.None, 0f);
             }
             //else
-                //orig(spriteBatch, inv, context, slot, position, lightColor);
+            //orig(spriteBatch, inv, context, slot, position, lightColor);
         }
-
-        public void TrySwitchingLoadoutWithFavorites(On_Player.orig_TrySwitchingLoadout orig, Player player, int loadoutIndex)//int loadoutIndex, Player player)
-        {
-            //TODO: possible design solution: only favorite one accessory per slot, or first loadout only. but then what if you have, e.g, wings,
-            //but you want to replace the wings with boots in the second slot if they're incompatible? just dont do that and use the same slot for wings always, i guess
-
-            if (player.whoAmI != Main.myPlayer || player.itemTime > 0 || player.itemAnimation > 0 || player.CCed || player.dead) return;
-            if (loadoutIndex == player.CurrentLoadoutIndex || loadoutIndex < 0 || loadoutIndex >= player.Loadouts.Length) return;
-
-            int currentLoadoutIndex = player.CurrentLoadoutIndex;
-            EquipmentLoadout oldLoadout = player.Loadouts[currentLoadoutIndex];
-            EquipmentLoadout newLoadout = player.Loadouts[loadoutIndex];
-
-            // --- Step 1: Place equips back into their loadout and clear the player's equips. ---
-            for (int i = 0; i < oldLoadout.Armor.Length; i++) { oldLoadout.Armor[i] = player.armor[i].Clone(); player.armor[i].TurnToAir(true); } //im only certain this is necessary for armor slots, not dye slots
-            for (int i = 0; i < oldLoadout.Dye.Length; i++) { oldLoadout.Dye[i] = player.dye[i].Clone(); player.dye[i].TurnToAir(true); }
-            for (int i = 0; i < oldLoadout.Hide.Length; i++) { oldLoadout.Hide[i] = player.hideVisibleAccessory[i]; }
-            // --- Step 2: Equip the new loadout and empty it. ---
-            for (int i = 0; i < newLoadout.Armor.Length; i++) { if (!newLoadout.Armor[i].IsAir) { player.armor[i] = newLoadout.Armor[i].Clone(); newLoadout.Armor[i].TurnToAir(true); } }
-            for (int i = 0; i < newLoadout.Dye.Length; i++) { if (!newLoadout.Dye[i].IsAir) { player.dye[i] = newLoadout.Dye[i].Clone(); newLoadout.Dye[i].TurnToAir(true); } }
-            for (int i = 0; i < newLoadout.Hide.Length; i++) { player.hideVisibleAccessory[i] = newLoadout.Hide[i]; }
-
-            // --- Step 3: Fill empty slots with the first valid favorited item. ---
-            for (int i = 0; i < player.armor.Length; i++)
-            {
-                if (player.armor[i].IsAir)
-                {
-                    for (int j = 0; j < player.Loadouts.Length; j++)
-                    {
-                        Item potentialItem = player.Loadouts[j].Armor[i];
-                        if (potentialItem.IsAir || !potentialItem.favorited) continue;
-
-                        bool vanity = i >= 10;
-                        bool canEquip = true;
-
-                        if (potentialItem.accessory && !IsAccessoryCompatible(player, potentialItem, vanity))
-                            canEquip = false;
-
-                        if (canEquip)
-                        {
-                            player.armor[i] = potentialItem.Clone();
-                            potentialItem.TurnToAir(true); //probably also here as well! actually we can just swap here instead of cloning?
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Dyes
-            for (int i = 0; i < player.dye.Length; i++)
-            {
-                if (player.dye[i].IsAir)
-                {
-                    for (int j = 0; j < player.Loadouts.Length; j++)
-                    {
-                        Item potentialDye = player.Loadouts[j].Dye[i];
-                        if (!potentialDye.IsAir && potentialDye.favorited)
-                        {
-                            player.dye[i] = potentialDye.Clone();
-                            potentialDye.TurnToAir(true); //may not need dye
-                            break;
-                        }
-                    }
-                }
-            }
-
-            player.CurrentLoadoutIndex = loadoutIndex;
-            if (player == Main.LocalPlayer) //Don't run this code if syncing on other clients
-            {
-                CloneLoadouts(player, Main.clientPlayer);
-                Main.mouseLeftRelease = false;
-                ItemSlot.RecordLoadoutChange();
-                SoundEngine.PlaySound(SoundID.MenuTick);
-                NetMessage.TrySendData(MessageID.SyncLoadout, -1, -1, null, player.whoAmI, loadoutIndex);
-                ParticleOrchestrator.RequestParticleSpawn(clientOnly: false, ParticleOrchestraType.LoadoutChange, new ParticleOrchestraSettings
-                {
-                    PositionInWorld = player.Center,
-                    UniqueInfoPiece = loadoutIndex
-                }, player.whoAmI);
-            }
-        }
-
-        
-        //copied from Vanilla private method
-        private static void CloneLoadouts(Player player, Player clonePlayer)
-        {
-            Item[] array = player.armor;
-            Item[] array2 = clonePlayer.armor;
-            for (int i = 0; i < array.Length; i++)
-            {
-                array[i].CopyNetStateTo(array2[i]);
-            }
-            array = player.dye;
-            array2 = clonePlayer.dye;
-            for (int j = 0; j < array.Length; j++)
-            {
-                array[j].CopyNetStateTo(array2[j]);
-            }
-            for (int k = 0; k < player.Loadouts.Length; k++)
-            {
-                array = player.Loadouts[k].Armor;
-                array2 = clonePlayer.Loadouts[k].Armor;
-                for (int l = 0; l < array.Length; l++)
-                {
-                    array[l].CopyNetStateTo(array2[l]);
-                }
-                array = player.Loadouts[k].Dye;
-                array2 = clonePlayer.Loadouts[k].Dye;
-                for (int m = 0; m < array.Length; m++)
-                {
-                    array[m].CopyNetStateTo(array2[m]);
-                }
-            }
-        }
-
 
         /// <summary>
         /// Whether an equippable accessory can be put into a specific slot.
@@ -260,7 +334,7 @@ namespace TransferableLoadouts
         private bool IsAccessoryCompatible(Player player, Item favoriteItem, bool vanity)
         {
             //NO accessory can be a duplicate, vanity or not
-            for (int i = 0 ; i < player.armor.Length; i++)
+            for (int i = 0; i < player.armor.Length; i++)
             {
                 if (!player.armor[i].IsAir && favoriteItem.IsTheSameAs(player.armor[i]))
                     return false;
@@ -341,6 +415,8 @@ namespace TransferableLoadouts
             }
             tag["favoritedEquips"] = list;
         }
+
+        // TODO Save favorited items in extra loadouts and mod accessory slots
         public Item[] GetAllEquipsForAllLoadouts()
         {
             List<Item> allEquips = [];
@@ -370,9 +446,10 @@ namespace TransferableLoadouts
             }
             return false;
         }
+
         /// <summary>
         /// Returns a new color, with each RGB component multiplied by the factor and capped at 255.
-        /// 
+        /// </summary>
         public static Color Brighten(this Color color, float factor)
         {
             // factor > 1.0 makes it brighter, e.g. 1.2f = 20% brighter
@@ -406,169 +483,140 @@ namespace TransferableLoadouts
         }
     }
 }
-public class JoinMessage : ModPlayer
-{
-    int timer = 5;
-    public override void OnEnterWorld()
-    {
-        timer = 5;
-    }
-    public override void PostUpdate()
-    {
-        if (timer > -1)
-            timer--;
-        if (timer == 0 && TransferableLoadouts.TransferableLoadouts.incompatibleModNames.Count > 0)
-        {
-            Main.NewText(Language.GetTextValue("Mods.TransferableLoadouts.IncompatabilityWarning", $"[c/EEEEEE:{string.Join(", ", TransferableLoadouts.TransferableLoadouts.incompatibleModNames)}]"), Color.Red);
-        }
-    }
-    //public override void Load()
-    //{
-    //    Terraria.On_Player.UpdateVisibleAccessory += VanityDebug;
-    //}
 
-    //private void VanityDebug(On_Player.orig_UpdateVisibleAccessory orig, Player self, int itemSlot, Item item, bool modded)
-    //{
-    //    if (item.frontSlot > -1)
-    //        Main.NewText($"{itemSlot}, {item}, {modded}, {item.frontSlot}", Color.Cyan);
-    //    //if (itemSlot == 14)
-    //    //    Main.NewText($"{itemSlot}, {item}, {modded}", Color.Red);
-    //    orig(self, itemSlot, item, modded);
-    //}
-}
-    //    private void TrySwitchingLoadoutWithFavorites(On_Player.orig_TrySwitchingLoadout orig, Player self, int loadoutIndex)
-    //    {
-    //        // --- PRE-SWITCH CHECKS (Similar to vanilla) ---
-    //        bool isPlayerBusy = self.itemTime > 0 || self.itemAnimation > 0;
-    //        if (self.whoAmI != Main.myPlayer || isPlayerBusy || self.CCed || self.dead)
-    //        {
-    //            return; // Player is busy, cannot switch
-    //        }
+//    private void TrySwitchingLoadoutWithFavorites(On_Player.orig_TrySwitchingLoadout orig, Player self, int loadoutIndex)
+//    {
+//        // --- PRE-SWITCH CHECKS (Similar to vanilla) ---
+//        bool isPlayerBusy = self.itemTime > 0 || self.itemAnimation > 0;
+//        if (self.whoAmI != Main.myPlayer || isPlayerBusy || self.CCed || self.dead)
+//        {
+//            return; // Player is busy, cannot switch
+//        }
 
-    //        if (loadoutIndex == self.CurrentLoadoutIndex || loadoutIndex < 0 || loadoutIndex >= self.Loadouts.Length)
-    //        {
-    //            return; // Invalid index or switching to the same loadout
-    //        }
+//        if (loadoutIndex == self.CurrentLoadoutIndex || loadoutIndex < 0 || loadoutIndex >= self.Loadouts.Length)
+//        {
+//            return; // Invalid index or switching to the same loadout
+//        }
 
-    //        int currentLoadoutIndex = self.CurrentLoadoutIndex;
-    //        EquipmentLoadout oldLoadout = self.Loadouts[currentLoadoutIndex];
-    //        EquipmentLoadout newLoadout = self.Loadouts[loadoutIndex];
+//        int currentLoadoutIndex = self.CurrentLoadoutIndex;
+//        EquipmentLoadout oldLoadout = self.Loadouts[currentLoadoutIndex];
+//        EquipmentLoadout newLoadout = self.Loadouts[loadoutIndex];
 
-    //        // --- ALGORITHM IMPLEMENTATION ---
+//        // --- ALGORITHM IMPLEMENTATION ---
 
-    //        // Step 1: Return the player's current equipment to its corresponding loadout storage.
-    //        // We do this for armor, accessories, and dyes.
-    //        for (int i = 0; i < oldLoadout.Armor.Length; i++)
-    //        {
-    //            oldLoadout.Armor[i] = self.armor[i].Clone(); // Store a copy
-    //            self.armor[i].TurnToAir(); // Clear the player's slot
-    //        }
-    //        for (int i = 0; i < oldLoadout.Dye.Length; i++)
-    //        {
-    //            oldLoadout.Dye[i] = self.dye[i].Clone();
-    //            self.dye[i].TurnToAir();
-    //        }
-    //        // For visibility toggles, we just copy the value.
-    //        for (int i = 0; i < oldLoadout.Hide.Length; i++)
-    //        {
-    //            oldLoadout.Hide[i] = self.hideVisibleAccessory[i];
-    //        }
+//        // Step 1: Return the player's current equipment to its corresponding loadout storage.
+//        // We do this for armor, accessories, and dyes.
+//        for (int i = 0; i < oldLoadout.Armor.Length; i++)
+//        {
+//            oldLoadout.Armor[i] = self.armor[i].Clone(); // Store a copy
+//            self.armor[i].TurnToAir(); // Clear the player's slot
+//        }
+//        for (int i = 0; i < oldLoadout.Dye.Length; i++)
+//        {
+//            oldLoadout.Dye[i] = self.dye[i].Clone();
+//            self.dye[i].TurnToAir();
+//        }
+//        // For visibility toggles, we just copy the value.
+//        for (int i = 0; i < oldLoadout.Hide.Length; i++)
+//        {
+//            oldLoadout.Hide[i] = self.hideVisibleAccessory[i];
+//        }
 
 
-    //        // Step 2: Take all non-air items from the loadout you're swapping TO and equip them.
-    //        // We clear the item from the new loadout's storage as we equip it.
-    //        for (int i = 0; i < newLoadout.Armor.Length; i++)
-    //        {
-    //            if (!newLoadout.Armor[i].IsAir)
-    //            {
-    //                self.armor[i] = newLoadout.Armor[i].Clone();
-    //                newLoadout.Armor[i].TurnToAir(); // Remove from storage
-    //            }
-    //        }
-    //        for (int i = 0; i < newLoadout.Dye.Length; i++)
-    //        {
-    //            if (!newLoadout.Dye[i].IsAir)
-    //            {
-    //                self.dye[i] = newLoadout.Dye[i].Clone();
-    //                newLoadout.Dye[i].TurnToAir();
-    //            }
-    //        }
-    //        for (int i = 0; i < newLoadout.Hide.Length; i++)
-    //        {
-    //            self.hideVisibleAccessory[i] = newLoadout.Hide[i];
-    //        }
+//        // Step 2: Take all non-air items from the loadout you're swapping TO and equip them.
+//        // We clear the item from the new loadout's storage as we equip it.
+//        for (int i = 0; i < newLoadout.Armor.Length; i++)
+//        {
+//            if (!newLoadout.Armor[i].IsAir)
+//            {
+//                self.armor[i] = newLoadout.Armor[i].Clone();
+//                newLoadout.Armor[i].TurnToAir(); // Remove from storage
+//            }
+//        }
+//        for (int i = 0; i < newLoadout.Dye.Length; i++)
+//        {
+//            if (!newLoadout.Dye[i].IsAir)
+//            {
+//                self.dye[i] = newLoadout.Dye[i].Clone();
+//                newLoadout.Dye[i].TurnToAir();
+//            }
+//        }
+//        for (int i = 0; i < newLoadout.Hide.Length; i++)
+//        {
+//            self.hideVisibleAccessory[i] = newLoadout.Hide[i];
+//        }
 
 
-    //        // Step 3: For each empty item slot, find the first loadout with a favorited item for that slot.
-    //        // This searches through ALL loadouts (0, 1, 2) in order.
+//        // Step 3: For each empty item slot, find the first loadout with a favorited item for that slot.
+//        // This searches through ALL loadouts (0, 1, 2) in order.
 
-    //        // Armor and Accessories
-    //        for (int i = 0; i < self.armor.Length; i++)
-    //        {
-    //            if (self.armor[i].IsAir) // Check if the slot is still empty
-    //            {
-    //                // Search all loadouts for a favorited item
-    //                for (int j = 0; j < self.Loadouts.Length; j++)
-    //                {
-    //                    Item potentialItem = self.Loadouts[j].Armor[i];
-    //                    if (!potentialItem.IsAir && potentialItem.favorited)
-    //                    {
-    //                        self.armor[i] = potentialItem.Clone(); // Equip the favorited item
-    //                        potentialItem.TurnToAir(); // Remove it from its original storage
-    //                        break; // Stop searching for this slot and move to the next
-    //                    }
-    //                }
-    //            }
-    //        }
+//        // Armor and Accessories
+//        for (int i = 0; i < self.armor.Length; i++)
+//        {
+//            if (self.armor[i].IsAir) // Check if the slot is still empty
+//            {
+//                // Search all loadouts for a favorited item
+//                for (int j = 0; j < self.Loadouts.Length; j++)
+//                {
+//                    Item potentialItem = self.Loadouts[j].Armor[i];
+//                    if (!potentialItem.IsAir && potentialItem.favorited)
+//                    {
+//                        self.armor[i] = potentialItem.Clone(); // Equip the favorited item
+//                        potentialItem.TurnToAir(); // Remove it from its original storage
+//                        break; // Stop searching for this slot and move to the next
+//                    }
+//                }
+//            }
+//        }
 
-    //        // Dyes
-    //        for (int i = 0; i < self.dye.Length; i++)
-    //        {
-    //            if (self.dye[i].IsAir) // Check if the dye slot is empty
-    //            {
-    //                for (int j = 0; j < self.Loadouts.Length; j++)
-    //                {
-    //                    Item potentialDye = self.Loadouts[j].Dye[i];
-    //                    if (!potentialDye.IsAir && potentialDye.favorited)
-    //                    {
-    //                        self.dye[i] = potentialDye.Clone();
-    //                        potentialDye.TurnToAir();
-    //                        break;
-    //                    }
-    //                }
-    //            }
-    //        }
+//        // Dyes
+//        for (int i = 0; i < self.dye.Length; i++)
+//        {
+//            if (self.dye[i].IsAir) // Check if the dye slot is empty
+//            {
+//                for (int j = 0; j < self.Loadouts.Length; j++)
+//                {
+//                    Item potentialDye = self.Loadouts[j].Dye[i];
+//                    if (!potentialDye.IsAir && potentialDye.favorited)
+//                    {
+//                        self.dye[i] = potentialDye.Clone();
+//                        potentialDye.TurnToAir();
+//                        break;
+//                    }
+//                }
+//            }
+//        }
 
-    //        // --- FINALIZE THE SWITCH (Copied from vanilla) ---
-    //        self.CurrentLoadoutIndex = loadoutIndex;
+//        // --- FINALIZE THE SWITCH (Copied from vanilla) ---
+//        self.CurrentLoadoutIndex = loadoutIndex;
 
-    //        // These calls are crucial for effects, sounds, and multiplayer synchronization.
-    //        Main.mouseLeftRelease = false;
-    //        ItemSlot.RecordLoadoutChange();
-    //        SoundEngine.PlaySound(SoundID.Grab);
-    //        NetMessage.TrySendData(MessageID.SyncLoadout, -1, -1, null, self.whoAmI, loadoutIndex); //TODO: this would need a custom senddata handler too, probably just use a modpacket
-    //        ParticleOrchestrator.RequestParticleSpawn(clientOnly: false, ParticleOrchestraType.LoadoutChange, new ParticleOrchestraSettings
-    //        {
-    //            PositionInWorld = self.Center,
-    //            UniqueInfoPiece = loadoutIndex
-    //        }, self.whoAmI);
-    //    }
-    //}   
+//        // These calls are crucial for effects, sounds, and multiplayer synchronization.
+//        Main.mouseLeftRelease = false;
+//        ItemSlot.RecordLoadoutChange();
+//        SoundEngine.PlaySound(SoundID.Grab);
+//        NetMessage.TrySendData(MessageID.SyncLoadout, -1, -1, null, self.whoAmI, loadoutIndex); //TODO: this would need a custom senddata handler too, probably just use a modpacket
+//        ParticleOrchestrator.RequestParticleSpawn(clientOnly: false, ParticleOrchestraType.LoadoutChange, new ParticleOrchestraSettings
+//        {
+//            PositionInWorld = self.Center,
+//            UniqueInfoPiece = loadoutIndex
+//        }, self.whoAmI);
+//    }
+//}   
 /*
-			case 147:
-			{
-				int num209 = this.reader.ReadByte();
-				if (Main.netMode == 2)
-				{
-					num209 = this.whoAmI;
-				}
-				int num219 = this.reader.ReadByte();
-				Main.player[num209].TrySwitchingLoadout(num219);
-				MessageBuffer.ReadAccessoryVisibility(this.reader, Main.player[num209].hideVisibleAccessory);
-				if (Main.netMode == 2)
-				{
-					NetMessage.TrySendData(b, -1, num209, null, num209, num219);
-				}
-				break;
-			}
+            case 147:
+            {
+                int num209 = this.reader.ReadByte();
+                if (Main.netMode == 2)
+                {
+                    num209 = this.whoAmI;
+                }
+                int num219 = this.reader.ReadByte();
+                Main.player[num209].TrySwitchingLoadout(num219);
+                MessageBuffer.ReadAccessoryVisibility(this.reader, Main.player[num209].hideVisibleAccessory);
+                if (Main.netMode == 2)
+                {
+                    NetMessage.TrySendData(b, -1, num209, null, num209, num219);
+                }
+                break;
+            }
 */
