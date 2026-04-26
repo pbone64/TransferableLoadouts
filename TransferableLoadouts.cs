@@ -411,8 +411,6 @@ namespace TransferableLoadouts
         public const string ModLoaderVanityKey = "vanity";
         public const string ModLoaderDyeKey = "dye";
 
-        private Dictionary<int, TagCompound> UnloadedLoadoutFavoriteData = new();
-
         // ModAccessorySlotPlayer::slots stores all slots on the player, which is not necessarily just the loaded slots! It also includes unloaded slots that still have items
         // There is no other way to access this data, so we need to get it via reflection
         private static readonly FieldInfo F_ModAccessorySlotPlayer_slots = typeof(ModAccessorySlotPlayer).GetField("slots", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -465,12 +463,6 @@ namespace TransferableLoadouts
                 loadoutTag[ModLoaderLoadoutKey] = modLoaderTag;
 
                 saveData[LoadoutKeyPrefix + i] = loadoutTag;
-            }
-
-            // Reproduce unloaded loadout favorite data so that it isn't lost
-            foreach ((int index, TagCompound data) in UnloadedLoadoutFavoriteData)
-            {
-                saveData[LoadoutKeyPrefix + index] = data;
             }
 
             tag[DataTagKey] = saveData;
