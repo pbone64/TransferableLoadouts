@@ -38,8 +38,6 @@ namespace TransferableLoadouts
         public const int ItemSlotContext_ModAccessorySlot_EquipAccessoryVanity = -11;
         public const int ItemSlotContext_ModAccessorySlot_EquipDye = -12;
 
-        private ILHook Hook_ModAccessorySlotPlayer_OnEquipmentLoadoutSwitched;
-
         public override void Load()
         {
             // The type that contains the field we want to change.
@@ -77,19 +75,14 @@ namespace TransferableLoadouts
 
             // We edit the same method as Extra Equipment Loadouts, so we try to register our callback with them to avoid any possible incompatabilities
             // This also causes our callback to be called when switching to and from loadouts added by them, which would not happen if we only edited the Vanilla method
-            if (LoadoutHelper.Advanced.RegisterPostSwapCallback((player, _, _) => { CopyLoadoutFavoritesForVanillaSlots(player); CopyLoadoutFavoritesForModLoaderSlots(player); }))
+            if (LoadoutHelper.Advanced.RegisterPostSwapCallback((player, _, _) => CopyLoadoutFavorites(player)))
             {
-                Logger.Info("Registered CopyLoadoutFavoritesForVanillaSlots() and CopyLoadoutFavoritesForModLoaderSlots() with Extra Equipment Loadouts.");
+                Logger.Info("Registered CopyLoadoutFavorites() with Extra Equipment Loadouts.");
             }
             else
             {
                 IL_Player.TrySwitchingLoadout += TrySwitchingLoadout_CallCopyFavorites;
-                Logger.Info("Inserted CopyLoadoutFavoritesForVanillaSlots() call into Player::TrySwitchingLoadout().");
-
-                // We have to use the ILHook class because we are patching an internal tModLoader class which they do not hookgen IL_* classes for
-                // The ILHook instance needs to be kept around as long as the mod is unloaded, as it is automatically unapplied when garbage collected
-                Hook_ModAccessorySlotPlayer_OnEquipmentLoadoutSwitched = new ILHook(typeof(ModAccessorySlotPlayer).GetMethod(nameof(ModAccessorySlotPlayer.OnEquipmentLoadoutSwitched)), OnEquipmentLoadoutSwitched_CallCopyFavorites);
-                Logger.Info("Inserted CopyLoadoutFavoritesForModLoaderSlots() call into ModAccessorySlotPlayer::OnEquipmentLoadoutSwitched().");
+                Logger.Info("Inserted CopyLoadoutFavorites() call into Player::TrySwitchingLoadout().");
             }
 
 
@@ -108,26 +101,10 @@ namespace TransferableLoadouts
                 throw new Exception("Failed while patching Player::TrySwitchingLoadout(): could not match (call PlayerLoader::OnEquipmentLoadoutSwitched)");
             }
 
-            // This should move us to right after loadouts have been swapped and the players loadout index has been updated
+            // After all the code for loadout switching as run, we need to copy over favorited items
 
-            c.Emit(OpCodes.Ldarg_0);
-            c.EmitDelegate(CopyLoadoutFavoritesForVanillaSlots);
-        }
-
-        private void OnEquipmentLoadoutSwitched_CallCopyFavorites(ILContext il)
-        {
-            ILCursor c = new(il);
-
-            if (!c.TryGotoNext(MoveType.After, instr => instr.MatchCall(typeof(ModAccessorySlotPlayer), "DetectConflictsWithSharedSlots")))
-            {
-                throw new Exception("Failed while patching ModAccessorySlotPlayer::OnEquipmentLoadoutSwitched(): could not match (call ModAccessorySlotPlayer::DetectConflictsWithSharedSlots)");
-            }
-
-            // This moves us to immediately after tML has swapped items for its loadouts
-
-            c.Emit(OpCodes.Ldarg_0);
-            c.EmitCall(typeof(ModPlayer).GetProperty(nameof(ModPlayer.Player)).GetAccessors()[0]);
-            c.EmitDelegate(CopyLoadoutFavoritesForModLoaderSlots);
+            c.Emit(OpCodes.Ldarg_0);                // Load the Player object that this method is being called on onto the stack
+            c.EmitDelegate(CopyLoadoutFavorites);   // Emit a call to CopyLoadoutFavoties, passing in the Player object from the top of the stack 
         }
 
         //TODO: possible design solution: only favorite one accessory per slot, or first loadout only. but then what if you have, e.g, wings,
@@ -137,7 +114,7 @@ namespace TransferableLoadouts
         /// <para>Copies the favorited item from the same slot in the earliest loadout for every empty slot in the current loadout.</para>
         /// <para>Must be called every time loadouts switch.</para>
         /// </summary>
-        public void CopyLoadoutFavoritesForVanillaSlots(Player player)
+        public void CopyLoadoutFavorites(Player player)
         {
             int numLoadouts = LoadoutHelper.TotalLoadouts();
 
@@ -184,15 +161,7 @@ namespace TransferableLoadouts
                     break;
                 }
             }
-        }
 
-        /// <summary>
-        /// <para>Copies the favorited item from the same ModAccessorySlot in the earliest loadout for every empty ModAccessorySlot in the current loadout.</para>
-        /// <para>Must be called every time loadouts switch.</para>
-        /// </summary>
-        public void CopyLoadoutFavoritesForModLoaderSlots(Player player)
-        {
-            int numLoadouts = LoadoutHelper.TotalLoadouts();
             var modPlayer = player.GetModPlayer<ModAccessorySlotPlayer>();
             var slotCount = modPlayer.SlotCount;
 
@@ -547,7 +516,6 @@ namespace TransferableLoadouts
                 // Load ModAccessorySlot loadout favourites
                 var modLoaderTag = loadoutTag.Get<TagCompound>(ModLoaderLoadoutKey);
 
-
                 foreach ((var fullName, var tagObj) in modLoaderTag)
                 {
                     var tag = tagObj as TagCompound;
@@ -585,7 +553,7 @@ namespace TransferableLoadouts
                 List<Item> allEquips = [];
                 for (int i = 0; i < Player.Loadouts.Length; i++)
                 {
-                    if (Player.CurrentLoadoutIndex == i)
+                    if (LoadoutHelper.CurrentLoadoutIndex(Player) == i)
                     {
                         allEquips.AddRange(Player.armor);
                         allEquips.AddRange(Player.dye);
