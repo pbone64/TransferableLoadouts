@@ -148,7 +148,7 @@ namespace TransferableLoadouts
             // Same for dye
             for (int i = 0; i < player.dye.Length; i++)
             {
-                if (!player.armor[i].IsAir) continue;
+                if (!player.dye[i].IsAir) continue;
 
                 for (int j = 0; j < numLoadouts; j++)
                 {
